@@ -3,14 +3,19 @@ use axum::{
     Router,
 };
 use dotenvy::dotenv;
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use jieba_rs::Jieba;
 use once_cell::sync::Lazy;
+use qdrant_client::qdrant::{CreateCollectionBuilder, Distance, VectorParamsBuilder};
+use qdrant_client::Qdrant;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::path::PathBuf;
+use tokio::sync::{RwLock, Mutex};
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use tokio::sync::RwLock; 
+use std::env;
 
 // 声明子模块
 mod handlers;
@@ -24,11 +29,31 @@ pub static JIEBA: Lazy<RwLock<Jieba>> = Lazy::new(|| RwLock::new(Jieba::new()));
 // 定义全局状态，方便在 Handler 中获取数据库连接池
 pub struct AppState {
     pub db: PgPool,
+    pub qdrant: Qdrant,
+    pub embed_model:  Mutex<TextEmbedding>,
+}
+
+async fn init_qdrant_collection(qdrant: &Qdrant) {
+    let collection_name = "word_roots";
+    // 如果集合不存在则创建
+    if !qdrant
+        .collection_exists(collection_name)
+        .await
+        .unwrap_or(false)
+    {
+        qdrant
+            .create_collection(
+                CreateCollectionBuilder::new(collection_name)
+                    .vectors_config(VectorParamsBuilder::new(384, Distance::Cosine)), // MiniLM 模型维度为 384
+            )
+            .await
+            .expect("无法创建 Qdrant 集合");
+    }
 }
 
 async fn init_custom_dictionary(pool: &PgPool) {
     tracing::info!("正在加载自定义词根词典...");
-    
+
     let roots = sqlx::query!("SELECT cn_name FROM standard_word_roots")
         .fetch_all(pool)
         .await
@@ -36,12 +61,12 @@ async fn init_custom_dictionary(pool: &PgPool) {
 
     // 获取写锁
     let mut jieba_write = JIEBA.write().await;
-    
+
     // 修复第二个报错：使用 &roots 引用，避免所有权转移
     for r in &roots {
         jieba_write.add_word(&r.cn_name, Some(99999), None);
     }
-    
+
     // 现在可以安全使用 roots.len()，因为 roots 没有被销毁
     tracing::info!("自定义词典加载完成，共计 {} 个词条", roots.len());
 }
@@ -70,7 +95,32 @@ async fn main() {
 
     init_custom_dictionary(&pool).await;
 
-    let shared_state = Arc::new(AppState { db: pool });
+
+    // 1. 获取当前程序运行的目录（绝对路径）
+    let current_dir = env::current_dir().expect("Failed to get current dir");
+    // 2. 拼接出 model 文件夹的绝对路径
+    let cache_path = current_dir.join("model").join("fastembed_cache");
+
+    tracing::info!("Loading embedding model from: {:?}", cache_path);
+
+    // 初始化 Qdrant 客户端 (默认地址)
+    let qdrant = Qdrant::from_url("http://localhost:6334").build().unwrap();
+    // 初始化 Embedding 模型 (ParaphraseMultilingual 适合中文)
+    let model = TextEmbedding::try_new(
+        InitOptions::new(EmbeddingModel::ParaphraseMLMiniLML12V2)
+            .with_cache_dir(PathBuf::from(cache_path)) // 指定项目根目录下的 model_cache
+            .with_show_download_progress(false),
+    )
+    .expect("离线加载失败！请检查 model/fastembed_cache 目录结构是否正确");
+
+    // 执行预热
+    init_qdrant_collection(&qdrant).await;
+
+    let shared_state = Arc::new(AppState {
+        db: pool,
+        qdrant,
+        embed_model: Mutex::new(model),
+    });
 
     // 4. 配置跨域 (CORS) - 开发阶段允许所有，生产环境需收紧
     let cors = CorsLayer::new()
@@ -85,7 +135,12 @@ async fn main() {
         .route("/login", post(handlers::auth_handler::login));
 
     // 2. 用户查询路由 (公开)
-    let public_routes = Router::new().route("/search", get(handlers::field_handler::search_field));
+    let public_routes = Router::new()
+        .route("/search", get(handlers::field_handler::search_field))
+        .route(
+            "/similar-roots",
+            get(handlers::mapping_handler::search_similar_roots),
+        );
 
     // 3. 管理员路由 (受保护)
     let admin_routes = Router::new()
@@ -110,7 +165,10 @@ async fn main() {
                 .delete(handlers::field_handler::delete_field),
         )
         // 新增用户管理路由
-        .route("/users", post(handlers::auth_handler::create_user_admin).get(handlers::auth_handler::list_users))
+        .route(
+            "/users",
+            post(handlers::auth_handler::create_user_admin).get(handlers::auth_handler::list_users),
+        )
         .route(
             "/users/:id",
             put(handlers::auth_handler::update_user_role)

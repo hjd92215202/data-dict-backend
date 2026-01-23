@@ -1,0 +1,21 @@
+# Windows 11 单机最强配置（2025 推荐）
+log_level: INFO
+
+storage:
+  storage_path: ./storage          # 数据自动存在当前目录的 storage 文件夹
+  snapshots_path: ./snapshots
+  on_disk_payload: true            # 关键！省内存神器，几百万条数据也只需几 GB 内存
+
+performance:
+  max_search_threads: 0            # 0 = 自动跑满所有 CPU 核心，搜索飞快
+
+service:
+  host: 0.0.0.0
+  http_port: 6333                  # REST API
+  grpc_port: 6334                  # gRPC（Python 客户端常用）
+  enable_cors: true                # 前端直连必开
+
+cluster:
+  enabled: false                   # 单机一定要关
+
+telemetry_disabled: true           # 关闭匿名上报，更清净

@@ -1,7 +1,9 @@
 use crate::models::word_root::{CreateWordRoot, WordRoot};
-use crate::AppState;
+use crate::{AppState, JIEBA};
 use axum::{extract::Path, extract::State, http::StatusCode, response::IntoResponse, Json};
 use std::sync::Arc;
+use qdrant_client::qdrant::{PointStruct, UpsertPointsBuilder, Value};
+use std::collections::HashMap;
 
 pub async fn create_root(
     State(state): State<Arc<AppState>>,
@@ -14,30 +16,39 @@ pub async fn create_root(
         VALUES ($1, $2, $3, $4, $5)
         RETURNING id, cn_name, en_abbr, en_full_name, associated_terms, remark, created_at
         "#,
-        payload.cn_name,
-        payload.en_abbr,
-        payload.en_full_name,
-        payload.associated_terms,
-        payload.remark
+        payload.cn_name, payload.en_abbr, payload.en_full_name, payload.associated_terms, payload.remark
     )
     .fetch_one(&state.db)
     .await;
 
     match result {
         Ok(root) => {
-            // 2. 【实时更新词典】
-            let mut jieba_write = crate::JIEBA.write().await;
-            jieba_write.add_word(&payload.cn_name, Some(99999), None);
+            // 实时更新分词词典
+            let mut jieba_write = JIEBA.write().await;
+            jieba_write.add_word(&root.cn_name, Some(99999), None);
 
-            tracing::info!("词典已实时同步新词根: {}", payload.cn_name);
+            // 计算向量并推送到 Qdrant
+            let text_to_embed = format!("{}: {}", root.cn_name, root.associated_terms.as_deref().unwrap_or(""));
+            let mut model = state.embed_model.lock().await;
+            if let Ok(embeddings) = model.embed(vec![text_to_embed], None) {
+                
+                // 修复：显式构建 Payload HashMap 并指明类型
+                let mut payload_map: HashMap<String, Value> = HashMap::new();
+                payload_map.insert("cn_name".to_string(), root.cn_name.clone().into());
+                payload_map.insert("en_abbr".to_string(), root.en_abbr.clone().into());
+
+                let point = PointStruct::new(
+                    root.id as u64, 
+                    embeddings[0].clone(),
+                    payload_map // 直接传入已确定类型的 HashMap
+                );
+                
+                let _ = state.qdrant.upsert_points(UpsertPointsBuilder::new("word_roots", vec![point])).await;
+            }
 
             (StatusCode::CREATED, Json(root)).into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB Error: {}", e),
-        )
-            .into_response(),
+        },
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

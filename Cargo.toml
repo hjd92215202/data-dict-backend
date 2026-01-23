@@ -29,3 +29,5 @@ jsonwebtoken = "9"   # JWT 处理
 axum-extra = { version = "0.9", features = ["typed-header"] } # 用于提取 Bearer Token
 rand_core = "0.9.5"
 rand = "0.8"
+qdrant-client = "1.10" # Qdrant 官方客户端
+fastembed = "5.8.1"         # 纯 Rust 实现的向量嵌入引擎

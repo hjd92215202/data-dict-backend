@@ -1,3 +1,9 @@
 /target
 .env
 *.xml
+*.exe
+snapshots
+storage
+.qdrant-initialized
+
+model/fastembed_cache
