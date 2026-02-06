@@ -1,9 +1,15 @@
-use axum::{extract::{State, Query}, Json, response::IntoResponse, http::StatusCode};
-use std::sync::Arc;
-use crate::AppState;
-use crate::services::mapping_service;
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use qdrant_client::qdrant::{point_id::PointIdOptions, SearchPointsBuilder};
 use serde::{Deserialize, Serialize};
-use qdrant_client::qdrant::{SearchPointsBuilder, point_id::PointIdOptions};
+use std::sync::Arc;
+
+use crate::services::mapping_service;
+use crate::AppState;
 
 #[derive(Deserialize)]
 pub struct SuggestQuery {
@@ -17,75 +23,105 @@ pub struct SuggestResponse {
     pub matched_ids: Vec<i32>,
 }
 
-/// 1. 分词建议接口 (管理员用)
+#[derive(Serialize)]
+pub struct RootSuggestion {
+    pub id: String,
+    pub cn_name: String,
+    pub en_abbr: String,
+    pub score: f32,
+}
+
+/// 1. 分词建议接口 (管理员生产标准字段的核心工具)
+/// 逻辑：将中文输入利用 JIEBA 切分，并匹配标准词根库（含同义词匹配）
 pub async fn suggest_mapping(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SuggestQuery>,
 ) -> impl IntoResponse {
-    // 逻辑已封装在 service 中，内部需处理 JIEBA 锁
-    let (suggested_en, missing_words, matched_ids) = 
+    if query.q.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "查询内容不能为空").into_response();
+    }
+
+    // 调用 Service 层逻辑，Service 内部已优化为：优先匹配 cn_name，其次正则匹配同义词
+    let (suggested_en, missing_words, matched_ids) =
         mapping_service::suggest_field_name(&state.db, &query.q).await;
-        
-    Json(SuggestResponse { suggested_en, missing_words, matched_ids })
+
+    Json(SuggestResponse {
+        suggested_en,
+        missing_words,
+        matched_ids,
+    })
+    .into_response()
 }
 
-/// 2. 语义相似度搜索接口 (普通用户搜不到时调用)
+/// 2. 语义相似度搜索词根 (生产辅助)
+/// 场景 A：管理员发现某个词没词根，想搜一下有没有意思相近的存量词根
+/// 场景 B：普通用户搜不到标准字段时，展示“相关词根”供参考
 pub async fn search_similar_roots(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SuggestQuery>,
 ) -> impl IntoResponse {
+    if query.q.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "查询内容不能为空").into_response();
+    }
 
     let mut model = state.embed_model.lock().await;
 
     // 将查询文本转为向量
     match model.embed(vec![&query.q], None) {
         Ok(query_vector) => {
-            // 在 Qdrant 中检索最相似的 5 个词根
-            let search_res = state.qdrant.search_points(
-                SearchPointsBuilder::new("word_roots", query_vector[0].clone(), 5)
-                    .with_payload(true)
-            ).await;
+            // 在 Qdrant 的 word_roots 集合中检索最相似的 5 个词根
+            let search_res = state.qdrant
+                .search_points(
+                    SearchPointsBuilder::new("word_roots", query_vector[0].clone(), 5)
+                        .with_payload(true),
+                )
+                .await;
 
             match search_res {
                 Ok(res) => {
-                    let suggestions: Vec<serde_json::Value> = res.result.into_iter().map(|p| {
-                        let pay = p.payload;
-                        
-                        // 1. 手动解析 PointId 为字符串
-                        let id_str = match p.id {
-                            Some(pid) => match pid.point_id_options {
-                                Some(PointIdOptions::Num(n)) => n.to_string(),
-                                Some(PointIdOptions::Uuid(u)) => u,
-                                None => "unknown".to_string(),
-                            },
-                            None => "none".to_string(),
-                        };
+                    let suggestions: Vec<RootSuggestion> = res
+                        .result
+                        .into_iter()
+                        .map(|p| {
+                            let pay = p.payload;
 
-                        // 2. 核心修复点：使用 .map(|s| s.as_str()) 将 &String 转为 &str
-                        // 这样 unwrap_or("") 才能匹配类型
-                        let cn_name = pay.get("cn_name")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.as_str()) 
-                            .unwrap_or("");
+                            // 解析 ID
+                            let id_str = match p.id {
+                                Some(pid) => match pid.point_id_options {
+                                    Some(PointIdOptions::Num(n)) => n.to_string(),
+                                    Some(PointIdOptions::Uuid(u)) => u,
+                                    None => "0".to_string(),
+                                },
+                                None => "0".to_string(),
+                            };
 
-                        let en_abbr = pay.get("en_abbr")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.as_str())
-                            .unwrap_or("");
+                            // 直接提取字符串，qdrant Value 的 as_str() 返回 Option<&str>
+                            let cn_name = pay.get("cn_name")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.as_str()) 
+                                .unwrap_or("")
+                                .to_string();
 
-                        serde_json::json!({
-                            "id": id_str,
-                            "cn_name": cn_name,
-                            "en_abbr": en_abbr,
-                            "score": p.score
+                            let en_abbr = pay.get("en_abbr")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            RootSuggestion {
+                                id: id_str,
+                                cn_name,
+                                en_abbr,
+                                score: p.score,
+                            }
                         })
-                    }).collect();
-                    
+                        .collect();
+
                     (StatusCode::OK, Json(suggestions)).into_response()
-                },
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                }
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("向量库检索失败: {}", e)).into_response(),
             }
-        },
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("向量计算失败: {}", e)).into_response(),
     }
 }

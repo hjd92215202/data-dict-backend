@@ -1,3 +1,7 @@
+use argon2::{
+    password_hash::{PasswordHasher, SaltString},
+    Argon2,
+};
 use axum::{
     routing::{get, post, put},
     Router,
@@ -6,16 +10,18 @@ use dotenvy::dotenv;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use jieba_rs::Jieba;
 use once_cell::sync::Lazy;
-use qdrant_client::qdrant::{CreateCollectionBuilder, Distance, VectorParamsBuilder};
+use qdrant_client::qdrant::{
+    CreateCollectionBuilder, Distance, PointStruct, UpsertPointsBuilder, VectorParamsBuilder,
+};
 use qdrant_client::Qdrant;
+use rand::rngs::OsRng;
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::path::PathBuf;
-use tokio::sync::{RwLock, Mutex};
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use std::env;
 
 // 声明子模块
 mod handlers;
@@ -26,17 +32,45 @@ mod services;
 // 使用 Lazy 确保 Jieba 词库只在启动时加载一次，并全局可用
 pub static JIEBA: Lazy<RwLock<Jieba>> = Lazy::new(|| RwLock::new(Jieba::new()));
 
-// 定义全局状态，方便在 Handler 中获取数据库连接池
+// 定义全局状态
 pub struct AppState {
     pub db: PgPool,
     pub qdrant: Qdrant,
-    pub embed_model:  Mutex<TextEmbedding>,
+    pub embed_model: Mutex<TextEmbedding>,
 }
 
+/// 确保数据库中存在默认管理员 admin/admin
+async fn ensure_default_admin(pool: &PgPool) {
+    let username = "admin";
+    let user_exists = sqlx::query!("SELECT id FROM users WHERE username = $1", username)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+
+    if user_exists.is_none() {
+        tracing::info!("未检测到管理员账号，正在创建默认账号: admin/admin");
+        let password = "admin";
+        let salt = SaltString::generate(&mut OsRng);
+        let password_hash = Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|h| h.to_string())
+            .expect("无法生成密码哈希");
+
+        let _ = sqlx::query!(
+            "INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3)",
+            username,
+            password_hash,
+            "admin"
+        )
+        .execute(pool)
+        .await;
+        tracing::info!("默认管理员账号创建完毕");
+    }
+}
+
+/// 同步词根向量到 Qdrant
 async fn sync_roots_to_qdrant(state: &AppState) {
-    tracing::info!("正在同步词根向量到 Qdrant...");
-    
-    // 1. 从数据库读取所有词根
+    tracing::info!("正在同步 [标准词根] 向量到 Qdrant...");
     let roots = sqlx::query_as!(
         crate::models::word_root::WordRoot,
         "SELECT id, cn_name, en_abbr, en_full_name, associated_terms, remark, created_at FROM standard_word_roots"
@@ -45,76 +79,128 @@ async fn sync_roots_to_qdrant(state: &AppState) {
     .await
     .unwrap_or_default();
 
-    if roots.is_empty() { return; }
+    if roots.is_empty() {
+        return;
+    }
 
     let mut points = Vec::new();
     let mut model = state.embed_model.lock().await;
 
     for root in &roots {
-        let text = format!("{}: {}", root.cn_name, root.associated_terms.as_deref().unwrap_or(""));
-        if let Ok(embeddings) = model.embed(vec![text], None) {
-            let mut payload_map: std::collections::HashMap<String, qdrant_client::qdrant::Value> = std::collections::HashMap::new();
-            payload_map.insert("cn_name".to_string(), root.cn_name.clone().into());
-            payload_map.insert("en_abbr".to_string(), root.en_abbr.clone().into());
+        // 增强向量特征：中文名 + 英文全称 + 同义词
+        let text = format!(
+            "{} {} {}",
+            root.cn_name,
+            root.en_full_name.as_deref().unwrap_or(""),
+            root.associated_terms.as_deref().unwrap_or("")
+        );
 
-            points.push(qdrant_client::qdrant::PointStruct::new(
+        if let Ok(embeddings) = model.embed(vec![text], None) {
+            let mut payload: std::collections::HashMap<String, qdrant_client::qdrant::Value> =
+                std::collections::HashMap::new();
+            payload.insert("cn_name".to_string(), root.cn_name.clone().into());
+            payload.insert("en_abbr".to_string(), root.en_abbr.clone().into());
+
+            points.push(PointStruct::new(
                 root.id as u64,
                 embeddings[0].clone(),
-                payload_map
+                payload,
             ));
         }
     }
 
-    // 2. 批量推送到 Qdrant
     if !points.is_empty() {
-        let _ = state.qdrant.upsert_points(
-            qdrant_client::qdrant::UpsertPointsBuilder::new("word_roots", points)
-        ).await;
-        tracing::info!("完成 {} 条词根向量同步", roots.len());
+        let _ = state
+            .qdrant
+            .upsert_points(UpsertPointsBuilder::new("word_roots", points))
+            .await;
+        tracing::info!("完成 {} 条 [词根] 向量同步", roots.len());
     }
 }
 
-async fn init_qdrant_collection(qdrant: &Qdrant) {
-    let collection_name = "word_roots";
-    // 如果集合不存在则创建
-    if !qdrant
-        .collection_exists(collection_name)
-        .await
-        .unwrap_or(false)
-    {
-        qdrant
-            .create_collection(
-                CreateCollectionBuilder::new(collection_name)
-                    .vectors_config(VectorParamsBuilder::new(384, Distance::Cosine)), // MiniLM 模型维度为 384
-            )
-            .await
-            .expect("无法创建 Qdrant 集合");
+/// 同步标准字段向量到 Qdrant (用于用户端模糊/语义搜索)
+async fn sync_fields_to_qdrant(state: &AppState) {
+    tracing::info!("正在同步 [标准字段] 向量到 Qdrant...");
+    let fields = sqlx::query_as!(
+        crate::models::field::StandardField,
+        r#"SELECT id, field_cn_name, field_en_name, composition_ids as "composition_ids!", 
+           data_type, associated_terms, is_standard as "is_standard!", created_at FROM standard_fields"#
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    if fields.is_empty() {
+        return;
+    }
+
+    let mut points = Vec::new();
+    let mut model = state.embed_model.lock().await;
+
+    for field in &fields {
+        // 向量特征：标准中文名 + 关联词
+        let text = format!(
+            "{} {}",
+            field.field_cn_name,
+            field.associated_terms.as_deref().unwrap_or("")
+        );
+
+        if let Ok(embeddings) = model.embed(vec![text], None) {
+            let mut payload: std::collections::HashMap<String, qdrant_client::qdrant::Value> =
+                std::collections::HashMap::new();
+            payload.insert("cn_name".to_string(), field.field_cn_name.clone().into());
+            payload.insert("en_name".to_string(), field.field_en_name.clone().into());
+
+            points.push(PointStruct::new(
+                field.id as u64,
+                embeddings[0].clone(),
+                payload,
+            ));
+        }
+    }
+
+    if !points.is_empty() {
+        let _ = state
+            .qdrant
+            .upsert_points(UpsertPointsBuilder::new("standard_fields", points))
+            .await;
+        tracing::info!("完成 {} 条 [标准字段] 向量同步", fields.len());
+    }
+}
+
+/// 初始化 Qdrant 两个独立的集合
+async fn init_qdrant_collections(qdrant: &Qdrant) {
+    let collections = vec!["word_roots", "standard_fields"];
+    for name in collections {
+        if !qdrant.collection_exists(name).await.unwrap_or(false) {
+            qdrant
+                .create_collection(
+                    CreateCollectionBuilder::new(name)
+                        .vectors_config(VectorParamsBuilder::new(384, Distance::Cosine)),
+                )
+                .await
+                .expect(&format!("无法创建 Qdrant 集合: {}", name));
+        }
     }
 }
 
 async fn init_custom_dictionary(pool: &PgPool) {
-    tracing::info!("正在加载自定义词根词典...");
-
+    tracing::info!("正在加载标准词根词典...");
     let roots = sqlx::query!("SELECT cn_name FROM standard_word_roots")
         .fetch_all(pool)
         .await
         .unwrap_or_default();
 
-    // 获取写锁
     let mut jieba_write = JIEBA.write().await;
-
-    // 修复第二个报错：使用 &roots 引用，避免所有权转移
     for r in &roots {
         jieba_write.add_word(&r.cn_name, Some(99999), None);
     }
-
-    // 现在可以安全使用 roots.len()，因为 roots 没有被销毁
     tracing::info!("自定义词典加载完成，共计 {} 个词条", roots.len());
 }
 
 #[tokio::main]
 async fn main() {
-    // 1. 初始化日志系统
+    // 1. 日志初始化
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
@@ -122,40 +208,33 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // 2. 加载 .env 环境变量
     dotenv().ok();
-    let database_url =
-        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env file");
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
-    // 3. 初始化数据库连接池
+    // 2. 数据库连接池
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
         .await
         .expect("Failed to create database connection pool");
 
+    // 3. 执行启动初始化
+    ensure_default_admin(&pool).await;
     init_custom_dictionary(&pool).await;
 
-
-    // 1. 获取当前程序运行的目录（绝对路径）
+    // 4. 获取模型缓存路径并初始化 Embedding 模型
     let current_dir = env::current_dir().expect("Failed to get current dir");
-    // 2. 拼接出 model 文件夹的绝对路径
     let cache_path = current_dir.join("model").join("fastembed_cache");
 
-    tracing::info!("Loading embedding model from: {:?}", cache_path);
-
-    // 初始化 Qdrant 客户端 (默认地址)
     let qdrant = Qdrant::from_url("http://localhost:6334").build().unwrap();
-    // 初始化 Embedding 模型 (ParaphraseMultilingual 适合中文)
+    init_qdrant_collections(&qdrant).await;
+
     let model = TextEmbedding::try_new(
         InitOptions::new(EmbeddingModel::ParaphraseMLMiniLML12V2)
-            .with_cache_dir(PathBuf::from(cache_path)) // 指定项目根目录下的 model_cache
+            .with_cache_dir(cache_path)
             .with_show_download_progress(false),
     )
-    .expect("离线加载失败！请检查 model/fastembed_cache 目录结构是否正确");
-
-    // 执行预热
-    init_qdrant_collection(&qdrant).await;
+    .expect("Failed to load embedding model");
 
     let shared_state = Arc::new(AppState {
         db: pool,
@@ -163,21 +242,21 @@ async fn main() {
         embed_model: Mutex::new(model),
     });
 
+    // 5. 启动同步
     sync_roots_to_qdrant(&shared_state).await;
+    sync_fields_to_qdrant(&shared_state).await;
 
-    // 4. 配置跨域 (CORS) - 开发阶段允许所有，生产环境需收紧
+    // 6. 配置 CORS
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // 5. 构建路由
-    // 1. 认证路由 (公开)
+    // 7. 路由聚合
     let auth_routes = Router::new()
         .route("/signup", post(handlers::auth_handler::signup))
         .route("/login", post(handlers::auth_handler::login));
 
-    // 2. 用户查询路由 (公开)
     let public_routes = Router::new()
         .route("/search", get(handlers::field_handler::search_field))
         .route(
@@ -185,7 +264,6 @@ async fn main() {
             get(handlers::mapping_handler::search_similar_roots),
         );
 
-    // 3. 管理员路由 (受保护)
     let admin_routes = Router::new()
         .route(
             "/roots",
@@ -207,7 +285,6 @@ async fn main() {
                 .put(handlers::field_handler::update_field)
                 .delete(handlers::field_handler::delete_field),
         )
-        // 新增用户管理路由
         .route(
             "/users",
             post(handlers::auth_handler::create_user_admin).get(handlers::auth_handler::list_users),
@@ -217,7 +294,6 @@ async fn main() {
             put(handlers::auth_handler::update_user_role)
                 .delete(handlers::auth_handler::delete_user),
         )
-        // 修复：建议接口属于管理员生产工具，移入 admin
         .route("/suggest", get(handlers::mapping_handler::suggest_mapping))
         .layer(axum::middleware::from_fn_with_state(
             shared_state.clone(),
@@ -230,7 +306,7 @@ async fn main() {
         .nest("/api/admin", admin_routes)
         .with_state(shared_state)
         .layer(cors);
-    // 6. 启动服务
+
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     tracing::info!("🚀 Server started at http://{}", addr);
 

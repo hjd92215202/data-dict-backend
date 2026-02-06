@@ -48,3 +48,11 @@ CREATE TABLE users (
     role VARCHAR(20) DEFAULT 'user', -- 'admin' 或 'user'
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 插入默认管理员 (密码为 admin)
+INSERT INTO users (username, password_hash, role) 
+VALUES ('admin', '$argon2id$v=19$m=19456,t=2,p=1$pL1X6nNwXH/Qz777puvtwA$PfoXdJLSEdkEc/Y10iM+GcsMZiFa3y5P5ynDVN+BcXI', 'admin')
+ON CONFLICT (username) DO NOTHING;
+
+-- 确保标准字段也有同义词索引
+CREATE INDEX IF NOT EXISTS idx_fields_associated_terms_trgm ON standard_fields USING GIN (associated_terms gin_trgm_ops);

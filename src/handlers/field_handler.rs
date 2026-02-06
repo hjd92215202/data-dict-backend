@@ -4,6 +4,8 @@ use crate::AppState;
 use crate::models::field::{CreateFieldRequest, StandardField};
 use crate::models::word_root::WordRoot;
 use crate::handlers::mapping_handler::SuggestQuery; 
+use qdrant_client::qdrant::SearchPointsBuilder;
+use qdrant_client::qdrant::point_id::PointIdOptions;
 
 /// 1. 创建标准字段
 pub async fn create_field(
@@ -125,9 +127,13 @@ pub async fn delete_field(State(state): State<Arc<AppState>>, Path(id): Path<i32
 }
 
 /// 6. 用户端搜索接口 (支持同义词模糊匹配)
-pub async fn search_field(State(state): State<Arc<AppState>>, Query(query): Query<SuggestQuery>) -> impl IntoResponse {
+pub async fn search_field(
+    State(state): State<Arc<AppState>>, 
+    Query(query): Query<SuggestQuery>
+) -> impl IntoResponse {
+    // 1. SQL 模糊匹配 (标准名 + 同义词)
     let q = format!("%{}%", query.q);
-    let result = sqlx::query_as!(
+    let sql_results = sqlx::query_as!(
         StandardField,
         r#"SELECT id, field_cn_name, field_en_name, composition_ids as "composition_ids!", 
                   data_type, associated_terms, is_standard as "is_standard!", created_at
@@ -135,10 +141,43 @@ pub async fn search_field(State(state): State<Arc<AppState>>, Query(query): Quer
            WHERE field_cn_name ILIKE $1 OR associated_terms ILIKE $1 
            LIMIT 10"#,
         q
-    ).fetch_all(&state.db).await;
+    ).fetch_all(&state.db).await.unwrap_or_default();
 
-    match result {
-        Ok(f) => Json(f).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    if !sql_results.is_empty() {
+        return Json(sql_results).into_response();
     }
+
+    // 2. 向量相似度搜索 (仅在 standard_fields 集合中搜)
+    let mut model = state.embed_model.lock().await;
+    if let Ok(vector) = model.embed(vec![&query.q], None) {
+        let search_res = state.qdrant.search_points(
+            SearchPointsBuilder::new("standard_fields", vector[0].clone(), 5).with_payload(true)
+        ).await;
+
+       if let Ok(res) = search_res {
+    let fields: Vec<serde_json::Value> = res.result.into_iter().map(|p| {
+        let pay = p.payload;
+        
+        // --- 核心修复：手动解析 PointId ---
+        let id_json = match p.id {
+            Some(pid) => match pid.point_id_options {
+                Some(PointIdOptions::Num(n)) => serde_json::json!(n),
+                Some(PointIdOptions::Uuid(u)) => serde_json::json!(u),
+                None => serde_json::json!(null),
+            },
+            None => serde_json::json!(null),
+        };
+
+        serde_json::json!({
+            "id": id_json, // 使用转换后的 JSON 值
+            "field_cn_name": pay.get("cn_name").and_then(|v| v.as_str()),
+            "field_en_name": pay.get("en_name").and_then(|v| v.as_str()),
+            "score": p.score
+        })
+    }).collect();
+    return (StatusCode::OK, Json(fields)).into_response();
+}
+    }
+
+    Json(Vec::<StandardField>::new()).into_response()
 }
