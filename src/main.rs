@@ -265,6 +265,7 @@ async fn main() {
 
     let public_routes = Router::new()
         .route("/search", get(handlers::field_handler::search_field))
+        .route("/tasks", post(handlers::task_handler::submit_task))
         .route(
             "/similar-roots",
             get(handlers::mapping_handler::search_similar_roots),
@@ -313,6 +314,9 @@ async fn main() {
                 .delete(handlers::auth_handler::delete_user),
         )
         .route("/suggest", get(handlers::mapping_handler::suggest_mapping))
+        .route("/tasks", get(handlers::task_handler::list_tasks)) // 获取待办
+        .route("/tasks/:id", put(handlers::task_handler::complete_task)) // 标记处理
+        .route("/tasks/count", get(handlers::task_handler::count_unprocessed_tasks))
         .layer(axum::middleware::from_fn_with_state(
             shared_state.clone(),
             middleware::auth::guard,
