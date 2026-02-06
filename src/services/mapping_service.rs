@@ -20,7 +20,8 @@ pub async fn suggest_field_name(pool: &PgPool, cn_input: &str) -> (String, Vec<S
                OR associated_terms ~* $2 
                LIMIT 1"#,
             word,
-            format!(r"(^|,){}(,|$)", word) // 正则匹配独立词
+            // 优化点：匹配开头、结尾或被空格包围的词，不区分大小写
+            format!(r"(^|[[:space:]]){}([[:space:]]|$)", word) 
         )
         .fetch_optional(pool)
         .await

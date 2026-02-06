@@ -37,13 +37,27 @@ pub async fn suggest_mapping(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SuggestQuery>,
 ) -> impl IntoResponse {
-    if query.q.trim().is_empty() {
+    let input = query.q.trim();
+    if input.is_empty() {
+        tracing::warn!("--- 收到空的分词建议请求");
         return (StatusCode::BAD_REQUEST, "查询内容不能为空").into_response();
     }
 
-    // 调用 Service 层逻辑，Service 内部已优化为：优先匹配 cn_name，其次正则匹配同义词
+    tracing::info!(">>> 正在为管理员生成分词建议: q='{}'", input);
+
+    // 调用 Service 层逻辑
     let (suggested_en, missing_words, matched_ids) =
-        mapping_service::suggest_field_name(&state.db, &query.q).await;
+        mapping_service::suggest_field_name(&state.db, input).await;
+
+    if !missing_words.is_empty() {
+        tracing::warn!("--- 词汇未完全标准化: 缺失词汇={:?}", missing_words);
+    }
+
+    tracing::info!(
+        "<<< 建议生成成功: en_abbr={}, matched_count={}",
+        suggested_en,
+        matched_ids.len()
+    );
 
     Json(SuggestResponse {
         suggested_en,
@@ -60,16 +74,20 @@ pub async fn search_similar_roots(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SuggestQuery>,
 ) -> impl IntoResponse {
-    if query.q.trim().is_empty() {
+    let input = query.q.trim();
+    if input.is_empty() {
         return (StatusCode::BAD_REQUEST, "查询内容不能为空").into_response();
     }
 
+    tracing::info!(">>> 正在检索语义相近词根: q='{}'", input);
+
     let mut model = state.embed_model.lock().await;
 
-    // 将查询文本转为向量
-    match model.embed(vec![&query.q], None) {
+    // 1. 将查询文本转为向量
+    tracing::debug!("--- 正在计算输入文本向量: '{}'", input);
+    match model.embed(vec![input], None) {
         Ok(query_vector) => {
-            // 在 Qdrant 的 word_roots 集合中检索最相似的 5 个词根
+            // 2. 在 Qdrant 的 word_roots 集合中检索最相似的 5 个词根
             let search_res = state.qdrant
                 .search_points(
                     SearchPointsBuilder::new("word_roots", query_vector[0].clone(), 5)
@@ -95,7 +113,6 @@ pub async fn search_similar_roots(
                                 None => "0".to_string(),
                             };
 
-                            // 直接提取字符串，qdrant Value 的 as_str() 返回 Option<&str>
                             let cn_name = pay.get("cn_name")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.as_str()) 
@@ -117,11 +134,18 @@ pub async fn search_similar_roots(
                         })
                         .collect();
 
+                    tracing::info!("<<< 语义搜索完成: 召回数量={}", suggestions.len());
                     (StatusCode::OK, Json(suggestions)).into_response()
                 }
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("向量库检索失败: {}", e)).into_response(),
+                Err(e) => {
+                    tracing::error!("!!! Qdrant 检索词根异常: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("向量库检索失败: {}", e)).into_response()
+                },
             }
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("向量计算失败: {}", e)).into_response(),
+        Err(e) => {
+            tracing::error!("!!! 向量模型计算异常: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("向量计算失败: {}", e)).into_response()
+        },
     }
 }

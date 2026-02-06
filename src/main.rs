@@ -3,7 +3,8 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    routing::{get, post, put},
+    extract::DefaultBodyLimit,
+    routing::{delete, get, post, put},
     Router,
 };
 use dotenvy::dotenv;
@@ -21,6 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // 声明子模块
@@ -200,20 +202,24 @@ async fn init_custom_dictionary(pool: &PgPool) {
 
 #[tokio::main]
 async fn main() {
+    dotenv().ok();
+
     // 1. 日志初始化
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-        ))
+        .with(tracing_subscriber::EnvFilter::from_default_env())
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    dotenv().ok();
+    tracing::info!(
+        "日志系统初始化完成, 当前级别: {}",
+        std::env::var("RUST_LOG").unwrap_or_default()
+    );
+
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     // 2. 数据库连接池
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(10)
         .connect(&database_url)
         .await
         .expect("Failed to create database connection pool");
@@ -271,6 +277,10 @@ async fn main() {
                 .get(handlers::word_root_handler::list_roots),
         )
         .route(
+            "/roots/batch",
+            post(handlers::word_root_handler::batch_create_roots),
+        )
+        .route(
             "/roots/:id",
             put(handlers::word_root_handler::update_root)
                 .delete(handlers::word_root_handler::delete_root),
@@ -280,10 +290,18 @@ async fn main() {
             post(handlers::field_handler::create_field).get(handlers::field_handler::list_fields),
         )
         .route(
+            "/fields/clear",
+            delete(handlers::field_handler::clear_all_fields),
+        )
+        .route(
             "/fields/:id",
             get(handlers::field_handler::get_field_details)
                 .put(handlers::field_handler::update_field)
                 .delete(handlers::field_handler::delete_field),
+        )
+        .route(
+            "/roots/clear",
+            delete(handlers::word_root_handler::clear_all_roots),
         )
         .route(
             "/users",
@@ -304,8 +322,10 @@ async fn main() {
         .nest("/api/auth", auth_routes)
         .nest("/api/public", public_routes)
         .nest("/api/admin", admin_routes)
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 允许 10MB 的请求体
         .with_state(shared_state)
-        .layer(cors);
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     tracing::info!("🚀 Server started at http://{}", addr);
