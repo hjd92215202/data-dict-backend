@@ -210,7 +210,7 @@ async fn init_qdrant_collections(qdrant: &Qdrant) {
 
 async fn init_custom_dictionary(pool: &PgPool) {
     tracing::info!("正在加载分词库自定义词典...");
-    let roots = sqlx::query!("SELECT cn_name FROM standard_word_roots")
+    let roots = sqlx::query!("SELECT cn_name, associated_terms FROM standard_word_roots")
         .fetch_all(pool)
         .await
         .unwrap_or_default();
@@ -218,6 +218,15 @@ async fn init_custom_dictionary(pool: &PgPool) {
     let mut jieba_write = JIEBA.write().await;
     for r in &roots {
         jieba_write.add_word(&r.cn_name, Some(99999), None);
+
+        // 2. 加入同义词（如果有的话）
+        if let Some(terms) = &r.associated_terms {
+            // 假设同义词是用空格分隔的（根据你之前的规范化逻辑）
+            for term in terms.split_whitespace() {
+                jieba_write.add_word(term, Some(99999), None);
+                tracing::debug!("添加同义词到分词器: {}", term);
+            }
+        }
     }
     tracing::info!("自定义词典加载完成，共计 {} 个词条", roots.len());
 }

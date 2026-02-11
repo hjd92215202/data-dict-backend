@@ -56,3 +56,9 @@ ON CONFLICT (username) DO NOTHING;
 
 -- 确保标准字段也有同义词索引
 CREATE INDEX IF NOT EXISTS idx_fields_associated_terms_trgm ON standard_fields USING GIN (associated_terms gin_trgm_ops);
+
+-- 给标准中文名增加唯一约束
+ALTER TABLE standard_fields ADD CONSTRAINT unique_field_cn_name UNIQUE (field_cn_name);
+
+-- 给标准英文名增加唯一约束
+ALTER TABLE standard_fields ADD CONSTRAINT unique_field_en_name UNIQUE (field_en_name);

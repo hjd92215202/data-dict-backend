@@ -15,6 +15,20 @@ pub async fn create_field(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateFieldRequest>,
 ) -> impl IntoResponse {
+
+    let existing = sqlx::query!(
+        "SELECT id FROM standard_fields WHERE field_cn_name = $1 OR field_en_name = $2 LIMIT 1",
+        payload.field_cn_name,
+        payload.field_en_name
+    )
+    .fetch_optional(&state.db)
+    .await;
+
+    if let Ok(Some(_)) = existing {
+        tracing::warn!("--- 尝试创建重复字段: cn={}, en={}", payload.field_cn_name, payload.field_en_name);
+        return (StatusCode::CONFLICT, "该标准中文名或英文名已存在，请勿重复创建").into_response();
+    }
+
     tracing::info!(">>> 开始创建标准字段: cn_name={}, en_name={}", payload.field_cn_name, payload.field_en_name);
 
     let result = sqlx::query_as!(

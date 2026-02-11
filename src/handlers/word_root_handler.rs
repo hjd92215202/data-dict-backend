@@ -79,6 +79,12 @@ pub async fn create_root(
             let mut jieba_write = JIEBA.write().await;
             jieba_write.add_word(&root.cn_name, Some(99999), None);
 
+            if let Some(terms) = &root.associated_terms {
+            for term in terms.split_whitespace() {
+                jieba_write.add_word(term, Some(99999), None);
+            }
+        }
+
             // B. 同步向量库
             let text_to_embed = format!(
                 "{} {} {}",
